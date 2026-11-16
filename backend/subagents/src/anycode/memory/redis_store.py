@@ -1,0 +1,95 @@
+"""Async Redis-backed MemoryStore with connection retry."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+from datetime import UTC, datetime
+from typing import Any
+
+try:
+    import redis.asyncio as aioredis
+except ImportError as exc:
+    raise ImportError("RedisStore requires the 'redis' package. Install it with: pip install anycode-py[redis]") from exc
+
+from anycode.constants import REDIS_KEY_PREFIX, REDIS_MAX_RETRIES, REDIS_RETRY_BASE_SECONDS
+from anycode.security.redaction import redact_sensitive, redact_text
+from anycode.types import MemoryEntry
+
+
+class RedisStore:
+    """Async Redis MemoryStore implementation with connection retry."""
+
+    def __init__(self, url: str = "redis://localhost:6379/0", *, redact_sensitive_data: bool = True) -> None:
+        self._url = url
+        self._redact_sensitive_data = redact_sensitive_data
+        self._client: aioredis.Redis | None = None  # type: ignore[type-arg]
+
+    async def setup(self) -> None:
+        self._client = aioredis.from_url(self._url, decode_responses=True)
+        await self._retry(self._client.ping)
+
+    async def teardown(self) -> None:
+        if self._client:
+            await self._client.aclose()
+            self._client = None
+
+    def _conn(self) -> aioredis.Redis:  # type: ignore[type-arg]
+        if self._client is None:
+            raise RuntimeError("RedisStore not initialized. Call setup() first.")
+        return self._client
+
+    async def get(self, key: str) -> MemoryEntry | None:
+        raw = await self._conn().get(REDIS_KEY_PREFIX + key)
+        if raw is None:
+            return None
+        return _deserialize(raw)
+
+    async def set(self, key: str, value: str, metadata: dict[str, Any] | None = None) -> None:
+        now = datetime.now(UTC).isoformat()
+        existing = await self.get(key)
+        created = existing.created_at.isoformat() if existing else now
+        stored_value = redact_text(value) if self._redact_sensitive_data else value
+        stored_metadata = redact_sensitive(metadata) if self._redact_sensitive_data else metadata
+        payload = json.dumps({"key": key, "value": stored_value, "metadata": stored_metadata, "created_at": created, "updated_at": now})
+        await self._conn().set(REDIS_KEY_PREFIX + key, payload)
+
+    async def list(self) -> list[MemoryEntry]:
+        keys: list[str] = []
+        async for k in self._conn().scan_iter(match=f"{REDIS_KEY_PREFIX}*"):
+            keys.append(k)
+        if not keys:
+            return []
+        values = await self._conn().mget(keys)
+        return [_deserialize(v) for v in values if v is not None]
+
+    async def delete(self, key: str) -> None:
+        await self._conn().delete(REDIS_KEY_PREFIX + key)
+
+    async def clear(self) -> None:
+        keys: list[str] = []
+        async for k in self._conn().scan_iter(match=f"{REDIS_KEY_PREFIX}*"):
+            keys.append(k)
+        if keys:
+            await self._conn().delete(*keys)
+
+    async def _retry(self, fn: Any) -> Any:
+        last_exc: Exception | None = None
+        for attempt in range(REDIS_MAX_RETRIES):
+            try:
+                return await fn()
+            except (ConnectionError, OSError) as exc:
+                last_exc = exc
+                await asyncio.sleep(REDIS_RETRY_BASE_SECONDS * (2**attempt))
+        raise ConnectionError(f"RedisStore: failed after {REDIS_MAX_RETRIES} retries") from last_exc
+
+
+def _deserialize(raw: str) -> MemoryEntry:
+    data = json.loads(raw)
+    return MemoryEntry(
+        key=data["key"],
+        value=data["value"],
+        metadata=data.get("metadata"),
+        created_at=datetime.fromisoformat(data["created_at"]),
+        updated_at=datetime.fromisoformat(data["updated_at"]) if data.get("updated_at") else None,
+    )

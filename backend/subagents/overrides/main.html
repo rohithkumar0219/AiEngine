@@ -1,0 +1,70 @@
+{% extends "base.html" %}
+
+<!--
+  AnyCode custom theme override.
+  Material already emits Open Graph + Twitter Card tags; here we add the
+  structured-data (JSON-LD) and crawler hints that traditional + AI search
+  engines use to understand and cite the docs.
+-->
+
+{% block extrahead %}
+  {% set page_title = page.meta.title if page and page.meta and page.meta.title else (page.title if page and page.title else config.site_name) %}
+  {% set page_desc = page.meta.description if page and page.meta and page.meta.description else config.site_description %}
+  <meta name="robots" content="index, follow, max-image-preview:large, max-snippet:-1">
+  <meta name="theme-color" content="#4f46e5">
+  <meta name="apple-mobile-web-app-title" content="AnyCode">
+  {% if page and page.meta and page.meta.keywords %}
+  <meta name="keywords" content="{{ page.meta.keywords }}">
+  {% endif %}
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@graph": [
+      {
+        "@type": "WebSite",
+        "@id": {{ (config.site_url ~ "#website") | tojson }},
+        "url": {{ config.site_url | tojson }},
+        "name": {{ config.site_name | tojson }},
+        "description": {{ config.site_description | tojson }},
+        "inLanguage": "en",
+        "publisher": { "@id": {{ (config.site_url ~ "#org") | tojson }} }
+      },
+      {
+        "@type": "Organization",
+        "@id": {{ (config.site_url ~ "#org") | tojson }},
+        "name": "Quantlix",
+        "url": "https://github.com/Quantlix",
+        "sameAs": [
+          "https://github.com/Quantlix",
+          "https://pypi.org/project/anycode-py/"
+        ]
+      },
+      {
+        "@type": "SoftwareSourceCode",
+        "@id": {{ (config.site_url ~ "#software") | tojson }},
+        "name": "AnyCode",
+        "description": {{ config.site_description | tojson }},
+        "url": {{ config.site_url | tojson }},
+        "codeRepository": "https://github.com/Quantlix/anycode",
+        "programmingLanguage": "Python",
+        "runtimePlatform": "Python 3.12+",
+        "license": "https://opensource.org/licenses/MIT",
+        "author": { "@id": {{ (config.site_url ~ "#org") | tojson }} },
+        "keywords": "multi-agent, AI orchestration, LLM, agent framework, task scheduling, tool use, Python"
+      }
+      {%- if page and not page.is_homepage %},
+      {
+        "@type": "TechArticle",
+        "headline": {{ page_title | tojson }},
+        "description": {{ page_desc | tojson }},
+        "url": {{ page.canonical_url | tojson }},
+        "inLanguage": "en",
+        "isPartOf": { "@id": {{ (config.site_url ~ "#website") | tojson }} },
+        "author": { "@id": {{ (config.site_url ~ "#org") | tojson }} },
+        "publisher": { "@id": {{ (config.site_url ~ "#org") | tojson }} }
+      }
+      {%- endif %}
+    ]
+  }
+  </script>
+{% endblock %}

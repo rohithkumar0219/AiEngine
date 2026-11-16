@@ -1,0 +1,62 @@
+name: Package Validation
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: package-validation-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13"]
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+
+      - name: Check version consistency
+        run: python scripts/check_versions.py
+
+      - name: Verify locked build environment
+        run: uv sync --locked --group dev
+
+      - name: Build distributions
+        run: |
+          rm -rf dist/ build/
+          uv run python -m build --no-isolation
+
+      - name: Verify distribution metadata
+        run: uv run twine check --strict dist/*
+
+      - name: Smoke test core and CLI wheel installs
+        run: |
+          python -m venv .pkgtest
+          . .pkgtest/bin/activate
+          python -m pip install --upgrade pip
+          wheel="$(ls dist/*.whl)"
+          python -m pip install "${wheel}"
+          python -c "from anycode import AnyCode; print(AnyCode.__name__)"
+          python -m pip install "${wheel}[cli]"
+          anycode version

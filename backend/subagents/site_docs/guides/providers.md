@@ -1,0 +1,273 @@
+---
+title: "Configure and Switch LLM Providers in AnyCode"
+description: "Point AnyCode agents at Anthropic, OpenAI, Google, Ollama, Bedrock, or Azure — set env vars and extras, mix providers in one team, and tune retry resilience."
+keywords: anycode providers, anthropic openai google ollama bedrock azure, create_adapter, provider api keys, ResilientAdapter, RetryPolicy, provider extras, multi-provider team
+---
+
+# Configure LLM Providers
+
+AnyCode is provider-agnostic: every agent names a `provider` and a `model`, and the engine builds the right adapter for you behind a single interface. This guide shows the six built-in providers, the environment variables and install extras each needs, how to mix providers inside one team, and how the built-in retry-and-circuit-breaker resilience layer wraps every call.
+
+## Supported providers
+
+| `provider` | Models (examples) | Required env vars | Install extra |
+| --- | --- | --- | --- |
+| `anthropic` | `claude-haiku-4-5`, `claude-sonnet-5` | `ANTHROPIC_API_KEY` | `anycode-py[anthropic]` |
+| `openai` | `gpt-4o-mini`, `gpt-5` | `OPENAI_API_KEY` | `anycode-py[openai]` |
+| `google` | `gemini-2.5-flash` | `GOOGLE_API_KEY` or `GEMINI_API_KEY` | `anycode-py[google]` |
+| `ollama` | any local model (e.g. `llama3.1`), or cloud models on ollama.com | none locally; `OLLAMA_API_KEY` for ollama.com | `anycode-py[ollama]` |
+| `bedrock` | AWS-hosted model IDs | AWS creds + `AWS_DEFAULT_REGION` | `anycode-py[bedrock]` |
+| `azure` | your deployment name | `AZURE_OPENAI_ENDPOINT`, `AZURE_OPENAI_API_KEY` | `anycode-py[azure]` |
+
+Every provider SDK is optional and lazy-loaded. If an extra is missing, the adapter raises an `ImportError` at construction with the exact `pip install "anycode-py[...]"` hint. Use `anycode-py[providers]` to install every built-in provider SDK.
+
+!!! note "FakeAdapter for tests"
+    `FakeAdapter` is a seventh, offline provider used for deterministic tests and CI. It returns scripted responses with zero network calls. See [Stream agent output](streaming.md) and [Run a multi-agent team](multi-agent-team.md) for how it slots in.
+
+## Pick a provider per agent
+
+The normal path is declarative: set `provider` and `model` on each `AgentConfig`. The engine resolves the adapter for you.
+
+=== "Anthropic"
+
+    ```python title="agent.py"
+    from anycode import AgentConfig
+
+    agent = AgentConfig(
+        name="assistant",
+        provider="anthropic",
+        model="claude-haiku-4-5",
+        tools=[],
+    )
+    ```
+
+=== "OpenAI"
+
+    ```python title="agent.py"
+    from anycode import AgentConfig
+
+    agent = AgentConfig(
+        name="assistant",
+        provider="openai",
+        model="gpt-4o-mini",
+        tools=[],
+    )
+    ```
+
+=== "Ollama (local)"
+
+    ```python title="agent.py"
+    from anycode import AgentConfig
+
+    agent = AgentConfig(
+        name="assistant",
+        provider="ollama",
+        model="llama3.1",
+        tools=[],
+    )
+    ```
+
+!!! warning "provider defaults to Anthropic"
+    If you leave `provider` unset (`None`), the agent falls back to `anthropic`. `model` is always required — there is no default model, so an agent with no `model` will not run.
+
+## Mix providers in one team
+
+Because each agent carries its own provider and model, a single team can spread work across vendors — a cheap, fast model for planning and a stronger model for review, for example.
+
+```python title="mixed_team.py"
+from anycode import AgentConfig, TeamConfig
+
+team_config = TeamConfig(
+    name="mixed-crew",
+    shared_memory=True,
+    agents=[
+        AgentConfig(name="planner", provider="openai", model="gpt-4o-mini", tools=[]),
+        AgentConfig(name="reviewer", provider="anthropic", model="claude-sonnet-5", tools=[]),
+    ],
+)
+```
+
+## Build an adapter directly
+
+For scripts that call a model without the orchestrator, use the async `create_adapter` factory. It returns a ready adapter you can `chat()` or `stream()` against.
+
+```python title="direct.py"
+from anycode import create_adapter
+from anycode.types import LLMChatOptions, LLMMessage, TextBlock
+
+adapter = await create_adapter("openai")  # async — always await
+messages = [LLMMessage(role="user", content=[TextBlock(text="Say hello in one sentence.")])]
+result = await adapter.chat(messages, LLMChatOptions(model="gpt-4o-mini", max_tokens=64))
+print(result.content[0].text, result.usage.input_tokens)
+```
+
+`create_adapter` takes provider-specific keyword arguments where a provider needs them:
+
+| Keyword | Applies to | Purpose |
+| --- | --- | --- |
+| `api_key` | all keyed providers | Override the env-var key |
+| `base_url` | ollama | Point at a non-default Ollama server |
+| `endpoint`, `api_version` | azure | Azure resource endpoint and API version |
+| `region`, `profile` | bedrock | AWS region and named profile |
+
+### Ollama: local and cloud
+
+The Ollama adapter speaks the native `/api/chat` endpoint and covers streaming, tool calling, thinking, structured outputs, and multimodal image input. A few knobs are adapter-specific, so construct `OllamaAdapter` directly when you need them:
+
+```python title="ollama_tuned.py"
+from anycode.providers.ollama import OllamaAdapter
+
+adapter = OllamaAdapter(
+    model="qwen3",
+    keep_alive="10m",                     # keep the model loaded between calls
+    think="high",                         # default thinking level (bool or low/medium/high/max)
+    default_options={"num_ctx": 8192, "seed": 7},  # any native Ollama option
+)
+```
+
+- `LLMChatOptions.max_tokens` maps to Ollama's `num_predict`; `temperature` passes through. Per-call options always override `default_options`.
+- `reasoning_effort` maps to the `think` level and `message.thinking` comes back as `ThinkingBlock` content and `thinking` stream events — see [Use reasoning models](reasoning-models.md).
+- `chat(..., response_format=...)` translates to Ollama's `format` parameter (`"json"` or a JSON schema).
+- Image blocks are sent as native base64 `images` arrays for multimodal models such as `llava`.
+- For [Ollama cloud](https://docs.ollama.com/cloud), set `base_url="https://ollama.com"` and export `OLLAMA_API_KEY` (or pass `api_key=`); the adapter sends the `Authorization: Bearer` header. A `404` from any server raises an error that names the missing model and the exact `ollama pull` command, and mid-stream server failures surface as terminal `error` stream events instead of a silently truncated answer.
+
+## Resilience is on by default
+
+Every adapter from `create_adapter` (and every agent run) is wrapped in a `ResilientAdapter`: a concurrency bulkhead, optional request pacing, automatic retries with exponential backoff and full jitter, a circuit breaker, and a per-call deadline. You get the default concurrency bound without configuring anything.
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `RetryPolicy.max_attempts` | `6` | Attempts before giving up |
+| `RetryPolicy.base_delay_seconds` | `1.0` | First backoff delay |
+| `RetryPolicy.max_delay_seconds` | `60.0` | Backoff ceiling |
+| `RetryPolicy.call_timeout_seconds` | `300.0` | Per-call deadline |
+| `ProviderResilienceConfig.circuit_failure_threshold` | `5` | Consecutive failures before the circuit opens |
+| `ProviderResilienceConfig.circuit_reset_seconds` | `120.0` | Wait before a half-open probe |
+| `ProviderResilienceConfig.max_concurrency` | `8` | Simultaneous provider attempts per event loop and capacity scope; `None` disables |
+| `ProviderResilienceConfig.requests_per_minute` | `None` | Evenly paced request starts; retries count; `None` disables |
+| `ProviderResilienceConfig.capacity_scope` | provider name | Adapters that share this value share one limiter |
+| `ProviderResilienceConfig.capacity_wait_timeout_seconds` | `300.0` | Queue wait before load shedding; `None` waits indefinitely |
+
+The limiter is shared by adapters with the same scope and settings in one event loop, which is how agents in a normal team obey one local provider cap. Use distinct scopes for independent API-key quotas. Configuring different limits for one scope raises an error instead of silently creating a second pool. A stream holds its concurrency slot until it completes or is closed, and every retry reacquires both the concurrency and request-rate gates. When the queue wait expires, `ProviderCapacityError` (a `ProviderUnavailableError`) load-sheds without opening the provider circuit.
+
+Retryable failures include timeouts, connection errors, and HTTP `408/409/429/500/502/503/504/529`; the layer honors a `Retry-After` header. Authentication and invalid-request errors are treated as terminal and never retried. When retries are exhausted or the circuit is open, `chat()` raises `ProviderUnavailableError`; a streaming call instead emits a terminal `error` event.
+
+```python title="resilience.py"
+from anycode import ProviderResilienceConfig, RetryPolicy, create_adapter
+
+# Bound parallel calls, pace request starts, and tighten retries.
+adapter = await create_adapter(
+    "anthropic",
+    resilience=ProviderResilienceConfig(
+        max_concurrency=4,
+        requests_per_minute=120,
+        capacity_scope="anthropic-production-key",
+        retry=RetryPolicy(max_attempts=3, call_timeout_seconds=60.0),
+    ),
+)
+
+# Or opt out entirely for a bare adapter.
+raw = await create_adapter("anthropic", resilience=ProviderResilienceConfig(enabled=False))
+```
+
+The request pacer controls request starts, not tokens per minute. Provider-side token quotas, organization-wide quotas, and traffic from other processes remain authoritative. In a multi-process or multi-host deployment, enforce the aggregate limit in your provider gateway or a distributed rate limiter as well as using this local bulkhead.
+
+Set one policy for all agents in Python, then override it only where a separate quota is intentional:
+
+```python title="team-capacity.py"
+from anycode import AnyCode, OrchestratorConfig, ProviderResilienceConfig
+
+engine = AnyCode(
+    OrchestratorConfig(
+        provider_resilience=ProviderResilienceConfig(
+            max_concurrency=4,
+            requests_per_minute=120,
+            capacity_scope="shared-production-key",
+        )
+    )
+)
+```
+
+!!! tip "Register your own provider"
+    Need a vendor AnyCode doesn't ship? Register an async provider factory under a new name and it becomes usable everywhere `provider="..."` is accepted. See [Extend AnyCode with plugins](plugins.md).
+
+## The complete, runnable program
+
+The snippets above are fragments. Here is a whole file, ready to copy into `providers.py` and run. It walks all six built-in providers, skips the ones whose credentials are not set, and sends a one-line prompt to each that is configured — so it runs with whatever key or keys you happen to have.
+
+```python title="providers.py"
+import asyncio
+import os
+
+from dotenv import load_dotenv
+
+from anycode import create_adapter
+from anycode.types import LLMChatOptions, LLMMessage, TextBlock
+
+load_dotenv()
+
+
+# Each entry: the provider name, an example model, and the env var that gates it.
+PROVIDERS: list[dict[str, str]] = [
+    {"name": "anthropic", "model": "claude-haiku-4-5", "env_key": "ANTHROPIC_API_KEY"},
+    {"name": "openai", "model": "gpt-4o-mini", "env_key": "OPENAI_API_KEY"},
+    {"name": "google", "model": "gemini-2.5-flash", "env_key": "GOOGLE_API_KEY"},
+    {"name": "ollama", "model": "llama3.1", "env_key": ""},
+    {"name": "bedrock", "model": "anthropic.claude-3-sonnet-20240229-v1:0", "env_key": "AWS_ACCESS_KEY_ID"},
+    {"name": "azure", "model": "gpt-4o", "env_key": "AZURE_OPENAI_API_KEY"},
+]
+
+
+async def demo_provider(name: str, model: str, env_key: str) -> None:
+    """Create an adapter for one provider and send a one-line prompt."""
+    if env_key and not os.getenv(env_key):
+        print(f"  [{name}] SKIPPED — {env_key} not set")
+        return
+    if name == "ollama":
+        print(f"  [{name}] SKIPPED — requires a local Ollama server")
+        return
+
+    try:
+        kwargs: dict[str, str] = {}
+        if name == "azure":
+            kwargs["endpoint"] = os.environ["AZURE_OPENAI_ENDPOINT"]
+        if name == "bedrock":
+            kwargs["region"] = os.getenv("AWS_DEFAULT_REGION", "us-east-1")
+
+        adapter = await create_adapter(name, **kwargs)
+        messages = [LLMMessage(role="user", content=[TextBlock(text="Say hello in one sentence.")])]
+        result = await adapter.chat(messages, LLMChatOptions(model=model, max_tokens=64))
+
+        text = result.content[0].text if result.content else "(empty)"
+        print(f"  [{name}] {text[:80]}")
+        print(f"           tokens: {result.usage.input_tokens}in / {result.usage.output_tokens}out")
+    except Exception as exc:  # noqa: BLE001 — demo: report the failure and keep going
+        print(f"  [{name}] ERROR — {exc}")
+
+
+async def main() -> None:
+    print("=== Multi-provider adapters ===\n")
+    for provider in PROVIDERS:
+        await demo_provider(provider["name"], provider["model"], provider["env_key"])
+    print("\nDone.")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+Run it from the project root:
+
+```bash
+uv run python providers.py
+```
+
+!!! tip "Tested copy"
+    See [`examples/09_multi_provider.py`](https://github.com/Quantlix/anycode/blob/main/examples/09_multi_provider.py).
+
+## Next steps
+
+- [Use reasoning models](reasoning-models.md) — reasoning effort and thinking budgets per provider.
+- [Extend AnyCode with plugins](plugins.md) — register a custom provider factory.
+- [Configuration reference](../reference/configuration.md) — every `AgentConfig` and resilience field.
+- [Run a multi-agent team](multi-agent-team.md) — put mixed-provider agents to work.

@@ -1,0 +1,43 @@
+version: '3.8'
+
+services:
+  iryax-platform:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: iryax-platform-engine
+    restart: unless-stopped
+    ports:
+      - "${PORT:-8000}:8000"
+    environment:
+      - GROQ_API_KEY=${GROQ_API_KEY}
+      - GROQ_MODEL=${GROQ_MODEL:-openai/gpt-oss-120b}
+      - JWT_SECRET_KEY=${JWT_SECRET_KEY}
+      - JWT_ISSUER=${JWT_ISSUER:-iryax-platform}
+      - JWT_AUDIENCE=${JWT_AUDIENCE:-iryax-admins}
+      - CORS_ALLOWED_ORIGINS=${CORS_ALLOWED_ORIGINS:-https://app.iryax.com,https://iryax.com}
+      - CONTACT_EMAIL=${CONTACT_EMAIL:-info@ingrainsystem.com}
+      - CONTACT_PHONE=${CONTACT_PHONE:-+91-9010481048}
+    volumes:
+      # Persistent SQLite auth database and backups
+      - iryax_auth_data:/app/backend/data
+      # ChromaDB persistent vector database
+      - iryax_chroma_data:/app/backend/data/chromadb
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:8000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+volumes:
+  iryax_auth_data:
+    name: iryax_auth_data
+  iryax_chroma_data:
+    name: iryax_chroma_data
+

@@ -1,0 +1,918 @@
+import json
+import logging
+import math
+import pathlib
+import os
+
+logger = logging.getLogger(__name__)
+from dotenv import load_dotenv
+from groq import Groq
+import chromadb
+from chromadb.utils import embedding_functions
+
+load_dotenv()
+CONTACT_EMAIL = os.getenv("CONTACT_EMAIL", "info@ingrainsystem.com")
+CONTACT_PHONE = os.getenv("CONTACT_PHONE", "+91-9010481048")
+
+# Config
+CHUNKS_PATH = pathlib.Path(__file__).parent / "data" / "processed" / "iryax_chunks.json"
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+MODEL_NAME = os.getenv("GROQ_MODEL", os.getenv("OLLAMA_MODEL", "openai/gpt-oss-120b"))
+DB_DIR = pathlib.Path(__file__).parent / "data" / "chromadb"
+
+_groq_client: Groq | None = None
+
+def get_groq_client() -> Groq:
+    global _groq_client
+    if _groq_client is None:
+        api_key = os.getenv("GROQ_API_KEY")
+        if not api_key:
+            raise ValueError("GROQ_API_KEY is not set. Please set GROQ_API_KEY in your .env file.")
+        _groq_client = Groq(api_key=api_key)
+    return _groq_client
+
+# Initialize ChromaDB and Embedding Function
+chroma_client = chromadb.PersistentClient(path=str(DB_DIR))
+embed_fn = embedding_functions.DefaultEmbeddingFunction()
+collection = chroma_client.get_or_create_collection(name="iryax_context_v2", embedding_function=embed_fn)
+
+def load_data_if_empty():
+    """Load chunks into ChromaDB if the collection is empty."""
+    if collection.count() > 0:
+        return
+    
+    if not CHUNKS_PATH.exists():
+        print("No chunks found at", CHUNKS_PATH)
+        return
+        
+    with open(CHUNKS_PATH, "r", encoding="utf-8") as f:
+        chunks = json.load(f)
+        
+    ids = []
+    documents = []
+    metadatas = []
+    
+    for c in chunks:
+        ids.append(c["chunk_id"])
+        documents.append(c["content"])
+        metadatas.append({
+            "url": c.get("url", ""),
+            "label": c.get("label", "")
+        })
+        
+    if ids:
+        collection.add(
+            ids=ids,
+            documents=documents,
+            metadatas=metadatas
+        )
+        print(f"Loaded {len(chunks)} chunks into ChromaDB.")
+    else:
+        print("No chunks found in iryax_chunks.json to load into ChromaDB.")
+
+# Load immediately upon import
+load_data_if_empty()
+
+import time
+import threading
+
+# Groq API requires no local prewarming
+
+
+import re
+
+CACHE_FILE = pathlib.Path(__file__).parent / "data" / "processed" / "response_cache.json"
+
+def _load_cache() -> dict:
+    if CACHE_FILE.exists():
+        try:
+            with open(CACHE_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+RESPONSE_CACHE = _load_cache()
+CACHE_EMBEDDINGS = {}
+
+def _update_cache_embeddings():
+    try:
+        for k in list(RESPONSE_CACHE.keys()):
+            if k not in CACHE_EMBEDDINGS:
+                CACHE_EMBEDDINGS[k] = embed_fn([k])[0]
+    except Exception:
+        pass
+
+threading.Thread(target=_update_cache_embeddings, daemon=True).start()
+
+def _cosine_similarity(vec1, vec2):
+    if not vec1 or not vec2 or len(vec1) != len(vec2):
+        return 0.0
+    dot = sum(a * b for a, b in zip(vec1, vec2))
+    norm1 = math.sqrt(sum(a * a for a in vec1))
+    norm2 = math.sqrt(sum(b * b for b in vec2))
+    if norm1 == 0 or norm2 == 0:
+        return 0.0
+    return dot / (norm1 * norm2)
+
+def find_semantic_cache_match(
+    query: str,
+    tenant_id: str,
+    threshold: float = 0.82,
+) -> str | None:
+    """Search semantic cache entries belonging only to the requested tenant."""
+
+    if not tenant_id:
+        raise ValueError("tenant_id is required for semantic cache access")
+
+    tenant_prefix = f"{tenant_id}:"
+
+    tenant_keys = [
+        key for key in CACHE_EMBEDDINGS
+        if key.startswith(tenant_prefix) and key in RESPONSE_CACHE
+    ]
+
+    if not tenant_keys:
+        return None
+
+    try:
+        query_vec = embed_fn([query])[0]
+        best_score = -1.0
+        best_key = None
+
+        for key in tenant_keys:
+            vec = CACHE_EMBEDDINGS[key]
+            score = _cosine_similarity(query_vec, vec)
+
+            if score > best_score:
+                best_score = score
+                best_key = key
+
+        if best_score >= threshold and best_key:
+            return RESPONSE_CACHE[best_key]
+
+    except Exception:
+        pass
+
+    return None
+_cache_lock = threading.Lock()
+
+def _save_cache():
+    try:
+        CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp_file = CACHE_FILE.with_suffix(".tmp")
+        with _cache_lock:
+            with open(tmp_file, "w", encoding="utf-8") as f:
+                json.dump(RESPONSE_CACHE, f, ensure_ascii=False, indent=2)
+            tmp_file.replace(CACHE_FILE)  # Atomic replace prevents corruption on crash
+    except Exception as exc:
+        logger.warning("Atomic cache save error: %s", exc)
+
+def _update_single_embedding(key: str):
+    try:
+        CACHE_EMBEDDINGS[key] = embed_fn([key])[0]
+    except Exception:
+        pass
+
+def get_cache_key(message: str, tenant_id: str) -> str:
+    if not tenant_id:
+        raise ValueError("tenant_id is required for cache access")
+
+    cleaned = re.sub(r'[^\w\s]', '', message.strip().lower())
+    normalized = ' '.join(cleaned.split())
+
+    return f"{tenant_id}:{normalized}"
+
+# Load structured intents database
+INTENTS_PATH = pathlib.Path(__file__).parent / "data" / "processed" / "structured_intents.json"
+STRUCTURED_INTENTS = []
+LAST_INTENT_LOAD_TIME = 0.0
+
+PAGES_FILE = pathlib.Path(__file__).parent / "data" / "raw" / "iryax_pages.json"
+RAW_PAGES_CACHE = {}
+LAST_PAGES_LOAD_TIME = 0.0
+
+def load_pages_cache():
+    global RAW_PAGES_CACHE, LAST_PAGES_LOAD_TIME
+    if PAGES_FILE.exists():
+        try:
+            mtime = os.path.getmtime(PAGES_FILE)
+            if mtime > LAST_PAGES_LOAD_TIME:
+                with open(PAGES_FILE, "r", encoding="utf-8") as f:
+                    RAW_PAGES_CACHE = json.load(f)
+                LAST_PAGES_LOAD_TIME = mtime
+        except Exception as e:
+            print("Error loading pages cache:", e)
+
+INTENT_EMBEDDINGS = {}
+
+def _update_intent_embeddings():
+    try:
+        for intent in STRUCTURED_INTENTS:
+            texts_to_embed = intent.get("exact_queries", []) + intent.get("phrases", [])
+            for text in texts_to_embed:
+                if text not in INTENT_EMBEDDINGS:
+                    INTENT_EMBEDDINGS[text] = embed_fn([text])[0]
+    except Exception as e:
+        print("EMBEDDING UPDATE ERROR:", e)
+
+def load_structured_intents():
+    global STRUCTURED_INTENTS, LAST_INTENT_LOAD_TIME
+    if INTENTS_PATH.exists():
+        try:
+            mtime = os.path.getmtime(INTENTS_PATH)
+            if mtime > LAST_INTENT_LOAD_TIME:
+                with open(INTENTS_PATH, "r", encoding="utf-8") as f:
+                    STRUCTURED_INTENTS = json.load(f).get("intents", [])
+                LAST_INTENT_LOAD_TIME = mtime
+                # INTENT_EMBEDDINGS will be lazily loaded in main thread
+        except Exception as e:
+            print("Error loading structured intents:", e)
+
+# Initial load
+load_structured_intents()
+load_pages_cache()
+
+def check_dynamic_intent(message: str):
+    """
+    Structured Database / Instant Answer lookup for predictable Dynamic Intents,
+    loaded dynamically from structured_intents.json to avoid hardcoded text in Python.
+    """
+    load_structured_intents()
+
+    msg_lower = message.strip().lower()
+    clean_msg = re.sub(r'[^\w\s]', '', msg_lower)
+    words = clean_msg.split()
+
+    # 1. Check exact query match for all intents
+    for intent in STRUCTURED_INTENTS:
+        if clean_msg in intent.get("exact_queries", []):
+            return (intent["name"], intent["answer"], intent.get("sources", []))
+            
+    # 2. Check phrase match for all intents
+    for intent in STRUCTURED_INTENTS:
+        if any(phrase in msg_lower for phrase in intent.get("phrases", [])):
+            return (intent["name"], intent["answer"], intent.get("sources", []))
+            
+    # Bypass structured intents if the user explicitly asks for detailed explanations
+    # and they didn't explicitly trigger an exact fast-path phrase above.
+    if "detail" in msg_lower or "explain" in msg_lower or "comprehensive" in msg_lower:
+        return None
+
+    # 3. Semantic Intent Routing
+    if not INTENT_EMBEDDINGS:
+        _update_intent_embeddings()
+        
+    try:
+        query_vec = embed_fn([msg_lower])[0]
+        best_score = -1.0
+        best_intent = None
+        
+        for intent in STRUCTURED_INTENTS:
+            texts_to_embed = intent.get("exact_queries", []) + intent.get("phrases", [])
+            for text in texts_to_embed:
+                vec = INTENT_EMBEDDINGS.get(text)
+                if vec:
+                    score = _cosine_similarity(query_vec, vec)
+                    if score > best_score:
+                        best_score = score
+                        best_intent = intent
+                        
+        if best_score >= 0.75 and best_intent:
+            return (best_intent["name"], best_intent["answer"], best_intent.get("sources", []))
+            
+    except Exception as e:
+        pass
+
+    return None
+
+def get_base_system_prompt():
+    return f"""You are Iryax Assistant, the official AI for Iryax Global.
+
+CRITICAL RULES — NO EXCEPTIONS:
+1. You MUST answer ONLY using the information explicitly stated in the <context> provided below.
+2. ABSOLUTE BAN: Do NOT use your training data, prior knowledge, or any assumptions — ever.
+3. PEOPLE & NAMES: NEVER mention, guess, or invent any person's name (founder, CEO, director, owner, employee). If asked about a person, respond ONLY: "I don't have that information. Please contact us at {CONTACT_EMAIL}."
+4. If ANY piece of information is NOT explicitly written in the context below, respond ONLY: "I don't have that information. Please contact us at {CONTACT_EMAIL}."
+5. NEVER say "based on my knowledge cutoff" or "I don't have real-time access".
+6. NEVER mention "context", "<context>", "context tags", or any internal system details. Just answer directly.
+7. When asked to list products or modules, list ONLY the 6 core products of Iryax (1. Recruitment, 2. Payroll, 3. Task Management, 4. Medical Camps, 5. Coworking Space, and 6. Lab Management) cleanly without dumping sub-features unless explicitly requested. NEVER list marketing categories like "HIRE SMARTER", "SYSTEMS", "PRODUCTIVITY", "HEALTH", "SPACES", or "PRECISION". When asked to list pricing plans or other items, answer ONLY about those specific requested items without mentioning products.
+8. EXTREME BREVITY REQUIRED: Your replies MUST be conversational, punchy, and a MAXIMUM of 2 to 3 short sentences. NEVER output long walls of text or long lists UNLESS the user explicitly asks for "details", OR if they ask about pricing/prices (in which case, you MUST output the full pricing tables or lists).
+9. NEVER invent URLs, emails, phone numbers, prices, job listings, or names of any person.
+10. NEVER invent or hallucinate processes, step-by-step instructions, or mobile apps that are not explicitly detailed in the provided context. If the exact steps are missing, say you do not have that information.
+11. For greetings, say you are "Iryax Assistant" and ask how you can help.
+12. MANDATORY: ALWAYS add this exact sentence at the very end of every informational response: "For additional information, please contact us at {CONTACT_EMAIL} or call {CONTACT_PHONE}."
+13. DIRECT LINKS: Mention relevant product/topic names clearly (such as Coworking Space, Recruitment, Payroll, Task Management, Medical Camps, Lab Management, Pricing, Contact, About, Careers).
+
+Company: Iryax Global | Website: https://iryax.com | Email: {CONTACT_EMAIL}
+"""
+
+LOGS_DIR = pathlib.Path(__file__).parent / "data" / "analytics"
+LOGS_DIR.mkdir(parents=True, exist_ok=True)
+ANALYTICS_FILE = LOGS_DIR / "logs.jsonl"
+
+def sync_structured_intents():
+    """Reload structured intents from disk and sync with latest scraped web pages if updated."""
+    global STRUCTURED_INTENTS
+    if INTENTS_PATH.exists():
+        try:
+            with open(INTENTS_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                STRUCTURED_INTENTS = data.get("intents", [])
+                
+            # Live intent sync logic removed. We rely on RAG for dynamic website data.
+        except Exception as e:
+            print("Error syncing structured intents:", e)
+            
+# Force reload
+
+# Force reload 3
+def clear_semantic_cache() -> int:
+    """Clear in-memory and disk response cache (called on delta sync update)."""
+    count = len(RESPONSE_CACHE)
+    RESPONSE_CACHE.clear()
+    CACHE_EMBEDDINGS.clear()
+    if CACHE_FILE.exists():
+        try:
+            CACHE_FILE.unlink()
+        except Exception:
+            pass
+    # Auto-sync structured intents database when web scraper runs
+    sync_structured_intents()
+    return count
+
+def log_conversation(message: str, response: str, sources: list, route: str, latency_ms: float):
+    def _write():
+        try:
+            entry = {
+                "timestamp": time.time(),
+                "query": message,
+                "response": response,
+                "sources": sources,
+                "route": route,
+                "latency_ms": round(latency_ms, 2)
+            }
+            with open(ANALYTICS_FILE, "a", encoding="utf-8") as f:
+                f.write(json.dumps(entry) + "\n")
+        except Exception:
+            pass
+    threading.Thread(target=_write, daemon=True).start()
+
+def log_feedback(query: str, rating: str, comment: str = "") -> dict:
+    try:
+        entry = {
+            "timestamp": time.time(),
+            "type": "feedback",
+            "query": query,
+            "rating": rating,
+            "comment": comment
+        }
+        with open(ANALYTICS_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry) + "\n")
+        return {"status": "success", "message": "Feedback recorded"}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+def get_analytics_summary() -> dict:
+    if not ANALYTICS_FILE.exists():
+        return {"total_queries": 0, "cache_hits": 0, "routes": {}, "avg_latency_ms": 0, "feedback": {"thumbs_up": 0, "thumbs_down": 0}}
+    
+    total = 0
+    cache_hits = 0
+    routes = {}
+    total_lat = 0.0
+    feedback_counts = {"thumbs_up": 0, "thumbs_down": 0}
+    
+    with open(ANALYTICS_FILE, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                data = json.loads(line)
+                if data.get("type") == "feedback":
+                    r = data.get("rating")
+                    if r in feedback_counts:
+                        feedback_counts[r] += 1
+                else:
+                    total += 1
+                    route = data.get("route", "rag_llm")
+                    routes[route] = routes.get(route, 0) + 1
+                    if route == "cache":
+                        cache_hits += 1
+                    total_lat += data.get("latency_ms", 0.0)
+            except Exception:
+                continue
+                
+    return {
+        "total_queries": total,
+        "cache_hits": cache_hits,
+        "routes": routes,
+        "avg_latency_ms": round(total_lat / max(1, total), 2),
+        "feedback": feedback_counts
+    }
+
+CONTACT_FOOTER = f"\n\nFor additional information, please contact us at {CONTACT_EMAIL} or call {CONTACT_PHONE}."
+
+# ── Broad set of Iryax-related terms for fast off-topic detection ─────────────
+# If the user message contains NONE of these words, skip ALL LLM/embedding work
+# and return the FAQ list instantly.
+IRYAX_KEYWORDS = {
+    # company
+    "iryax", "ingrain", "ingrainsystem",
+    # products / modules
+    "product", "products", "module", "modules", "feature", "features",
+    "service", "services", "solution", "solutions", "offering", "offerings",
+    "software", "tools", "platform", "system", "suite", "integrations",
+    "capabilities", "erp", "hrms", "hris",
+    # recruitment
+    "recruitment", "recruit", "hire", "hiring", "applicant", "candidate",
+    "job", "jobs", "resume", "cv", "screening", "onboarding", "ats",
+    "shortlist", "interview", "headcount", "manpower", "staffing",
+    # payroll / attendance
+    "payroll", "attendance", "leave", "salary", "timesheet", "roster", "shift",
+    "wages", "payslip", "deduction", "tax", "tds", "pf", "esi", "epf",
+    "ctc", "overtime", "biometric", "geofencing", "punch", "wfh",
+    # task management
+    "task", "tasks", "project", "sprint", "agile", "collaboration",
+    "kanban", "backlog", "checklist", "deadline", "milestone", "workflow",
+    # medical camps
+    "medical", "camp", "camps", "health", "patient", "volunteer",
+    "clinic", "screening", "checkup", "ngo", "wellness",
+    # workspace
+    "workspace", "coworking", "cabin", "desk", "room", "booking", "iot",
+    "space", "office", "conference", "meeting", "hotdesk", "flexi",
+    # pricing
+    "price", "prices", "pricing", "cost", "fee", "fees", "plan", "plans",
+    "subscription", "rate", "charge", "charges", "amount", "budget",
+    "affordable", "expensive", "cheap", "quote", "quotation", "invoice",
+    "rupees", "inr", "license", "licensing", "renewal",
+    "basic", "premium", "enterprise", "custom",
+    # company info
+    "about", "company", "overview", "history", "mission", "vision",
+    "who", "what", "how", "explain", "tell",
+    "works", "work", "founded", "established",
+    # security / trust
+    "secure", "security", "privacy", "data", "protection", "gdpr",
+    "encryption", "safe", "trust", "compliance", "policy", "terms",
+    "ssl", "backup", "soc2",
+    # contact / support
+    "contact", "email", "phone", "support", "address", "office", "location",
+    "helpdesk", "ticket", "complaint", "enquiry", "inquiry", "whatsapp",
+    "demo", "book", "schedule", "trial",
+    # careers
+    "career", "careers", "vacancy", "vacancies", "opening", "internship",
+    "position", "fresher", "experienced", "employment", "apply", "application",
+    "developer", "designer", "marketing", "placement",
+    # greetings
+    "hi", "hello", "hey", "hai", "namaste",
+}
+
+# ── FAQ shown instantly when query is off-topic (no LLM/embedding used) ───────
+FAQ_RESPONSE = """I can only help with questions about **Iryax Global**. Here are some things I can answer:
+
+❓ **Products & Features**
+- What products does Iryax offer?
+- Tell me about Recruitment / Payroll / Task Management / Workspace / Medical Camps
+
+💰 **Pricing**
+- What are the pricing plans?
+- Basic / Premium / Enterprise / Custom plan details
+
+🏢 **Company**
+- About Iryax Global
+- How does Iryax work?
+- Is my data secure with Iryax?
+
+📞 **Contact & Demo**
+- How can I contact Iryax support?
+- How do I book a demo?
+
+💼 **Careers**
+- What job openings are available at Iryax?
+
+For anything else not listed here, please contact us at {CONTACT_EMAIL} or call {CONTACT_PHONE}.""".format(CONTACT_EMAIL=CONTACT_EMAIL, CONTACT_PHONE=CONTACT_PHONE)
+
+def _is_off_topic(message: str) -> bool:
+    """Return True if message contains NO Iryax-related keywords at all.
+    This check runs before any embedding/ChromaDB/LLM work, making it free."""
+    words = set(re.sub(r'[^\w\s]', '', message.lower()).split())
+    return not words.intersection(IRYAX_KEYWORDS)
+
+def _ensure_contact_footer(text: str) -> str:
+    """Guarantee every response ends with the standard contact footer."""
+    if "For additional information" not in text:
+        return text.rstrip() + CONTACT_FOOTER
+    return text
+
+_PAGE_LINK_MAP = [
+    (r"medical\s+camps?",         "https://iryax.com/camp"),
+    (r"task\s+management",        "https://iryax.com/task-management"),
+    (r"co\s+working\s+space",     "https://iryax.com/workspace"),
+    (r"coworking\s+space",        "https://iryax.com/workspace"),
+    (r"workingspace",             "https://iryax.com/workspace"),
+    (r"products?",                "https://iryax.com/products"),
+    (r"pricing",                  "https://iryax.com/price"),
+    (r"price\s+list",             "https://iryax.com/price"),
+    (r"contact",                  "https://iryax.com/contact"),
+    (r"about",                    "https://iryax.com/about"),
+    (r"recruitment",              "https://iryax.com/recruitment"),
+    (r"payroll",                  "https://iryax.com/attendance"),
+    (r"attendance",               "https://iryax.com/attendance"),
+    (r"workspace",                "https://iryax.com/workspace"),
+    (r"careers?",                 "https://iryax.com/careers"),
+    (r"privacy\s+policy",         "https://iryax.com/privacy-policy"),
+    (r"terms\s+and\s+conditions", "https://iryax.com/terms-and-conditions"),
+]
+
+
+def sanitize_nested_markdown_links(text: str) -> str:
+    """Repair any malformed nested markdown links like [Coworking Space](https://iryax.com/[workspace](https://...))"""
+    nested_pattern = re.compile(r'\[([^\]]+)\]\([^)]*\[[^\]]+\]\((https?://[^)]+)\)\)')
+    text = nested_pattern.sub(r'[\1](\2)', text)
+    return text
+
+def _inject_page_links(text: str) -> str:
+    """Post-process bot response to inject markdown links for known Iryax pages and email autolinks safely."""
+    text = sanitize_nested_markdown_links(text)
+
+    # Strip backticks around emails and phones so they can be converted to proper clickable markdown links
+    text = re.sub(r'`([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})`', r'\1', text)
+    text = re.sub(r'`(\+91[-\s]?\d{10}|\+?\d{10,12})`', r'\1', text)
+
+    email_pattern = re.compile(r'\b([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})\b')
+
+    def get_protected_spans(s: str):
+        spans = []
+        for m in re.finditer(r'\[[^\]]*\]\([^)]*\)', s):
+            spans.append(m.span())
+        for m in re.finditer(r'https?://[^\s)]+', s):
+            spans.append(m.span())
+        for m in re.finditer(r'<[^>]+>', s):
+            spans.append(m.span())
+
+        if not spans:
+            return []
+
+        spans.sort(key=lambda x: x[0])
+        merged = [spans[0]]
+        for curr in spans[1:]:
+            prev_s, prev_e = merged[-1]
+            if curr[0] <= prev_e:
+                merged[-1] = (prev_s, max(prev_e, curr[1]))
+            else:
+                merged.append(curr)
+        return merged
+
+    # 1. Convert emails and phone numbers outside protected spans
+    protected = get_protected_spans(text)
+    new_text = ""
+    last_idx = 0
+    phone_pattern = re.compile(r'(\+91[-\s]?\d{10}|\+?\d{10,12})')
+
+    def format_phone(match):
+        num = match.group(1)
+        clean_num = re.sub(r'[^\d+]', '', num)
+        if not clean_num.startswith('+'):
+            clean_num = '+' + clean_num
+        return f"[{num}](tel:{clean_num})"
+
+    for ps, pe in protected:
+        if last_idx < ps:
+            chunk = text[last_idx:ps]
+            chunk = email_pattern.sub(r'[\1](mailto:\1)', chunk)
+            chunk = phone_pattern.sub(format_phone, chunk)
+            new_text += chunk
+        new_text += text[ps:pe]
+        last_idx = pe
+    if last_idx < len(text):
+        chunk = text[last_idx:]
+        chunk = email_pattern.sub(r'[\1](mailto:\1)', chunk)
+        chunk = phone_pattern.sub(format_phone, chunk)
+        new_text += chunk
+    text = new_text
+
+
+    # 2. Convert keywords to markdown links outside protected spans
+    for pat, link in _PAGE_LINK_MAP:
+        protected = get_protected_spans(text)
+        regex = re.compile(rf"\b({pat})\b", flags=re.IGNORECASE)
+        
+        new_text = ""
+        last_idx = 0
+        for ps, pe in protected:
+            if last_idx < ps:
+                chunk = text[last_idx:ps]
+                chunk = regex.sub(rf"[\1]({link})", chunk)
+                new_text += chunk
+            new_text += text[ps:pe]
+            last_idx = pe
+        if last_idx < len(text):
+            chunk = text[last_idx:]
+            chunk = regex.sub(rf"[\1]({link})", chunk)
+            new_text += chunk
+        text = new_text
+
+    return sanitize_nested_markdown_links(text)
+
+
+
+# ── Topics we know are NOT in our scraped data — must never reach the LLM ─────
+# The 3B model will hallucinate names/facts for these if given the chance.
+_NO_INFO_PATTERNS = re.compile(
+    r"\b(founder|co-founder|cofounder|ceo|chief executive|chairman|director|owner|"
+    r"president|managing director|md\b|founded by|started by|created by|built by|"
+    r"established by|who (started|created|built|runs|owns|leads|founded) iryax|"
+    r"who (is|are) the (founder|ceo|owner|head|team|leader|management))\b",
+    re.IGNORECASE
+)
+
+_NO_INFO_RESPONSE = (
+    f"I don't have information about the founders or leadership team of Iryax Global. "
+    f"For additional information, please contact us at {CONTACT_EMAIL} or call {CONTACT_PHONE}."
+)
+
+def generate_rag_response(
+    user_message: str,
+    history: list,
+    tenant_id: str | None = None,
+    user_id: str | None = None,
+):
+    start_t = time.time()
+
+    # ── Conversational guard ─────────
+    msg_lower_clean = re.sub(r'[^\w\s]', '', user_message.lower()).strip()
+    is_greeting = msg_lower_clean in ["hi", "hello", "hey", "hola", "hithere"]
+    is_ok = msg_lower_clean in ["ok", "okay", "alright", "gotit", "cool", "nice", "good"]
+    is_thanks = msg_lower_clean in ["thanks", "thankyou", "thx", "appreciateit", "done"]
+
+    if is_greeting or is_ok or is_thanks:
+        reply = "Hello! I am Iryax Assistant. How can I help you today?"
+        if is_ok:
+            reply = "Great!Thanks for the enquiry. Let me know if you need anything else."
+        if is_thanks:
+            reply = "You're welcome! Thanks for the enquiry. Let me know if there is anything else."
+        
+        log_conversation(user_message, reply, [], "conversational", (time.time() - start_t) * 1000)
+        words = reply.split(" ")
+        for i, w in enumerate(words):
+            yield json.dumps({"token": w + (" " if i < len(words) - 1 else ""), "sources": []}) + "\n"
+        return
+
+    # ── Off-topic guard: fires before ANY embedding/ChromaDB/LLM work ─────────
+    # If the message has zero Iryax-related words, skip everything and show FAQ.
+    if _is_off_topic(user_message):
+        log_conversation(user_message, FAQ_RESPONSE, [], "off_topic_faq", (time.time() - start_t) * 1000)
+        for word in FAQ_RESPONSE.split(" "):
+            yield json.dumps({"token": word + " ", "sources": []}) + "\n"
+        return
+
+    # ── Unanswerable guard: topics not in our data — stop before LLM ──────────
+    # Prevents the model from hallucinating names, founders, CEOs, etc.
+    if _NO_INFO_PATTERNS.search(user_message):
+        log_conversation(user_message, _NO_INFO_RESPONSE, [], "no_info_guard", (time.time() - start_t) * 1000)
+        yield json.dumps({"token": _NO_INFO_RESPONSE, "sources": []}) + "\n"
+        return
+
+    # ── Query Router: Dynamic Intent (PRICING / JOBS / CONTACT / PRODUCTS) ───
+    dynamic_match = check_dynamic_intent(user_message)
+    if dynamic_match:
+        intent_name, instant_ans, intent_sources = dynamic_match
+        instant_ans = _ensure_contact_footer(instant_ans)
+        instant_ans = _inject_page_links(instant_ans)
+        log_conversation(user_message, instant_ans, intent_sources, f"instant_{intent_name}", (time.time() - start_t) * 1000)
+        words = instant_ans.replace("\r", "").split(" ")
+        for w in words:
+            yield json.dumps({"token": w + " ", "sources": intent_sources}) + "\n"
+        return
+
+    # ── Tenant-isolated cache ────────────────────────────────────────────────
+    # Never reuse cached answers when conversation history is present.
+    cache_enabled = bool(tenant_id) and not history
+
+    if cache_enabled:
+        cache_key = get_cache_key(user_message, tenant_id)
+
+        # Exact match
+        if cache_key in RESPONSE_CACHE:
+            cached_ans = _ensure_contact_footer(RESPONSE_CACHE[cache_key])
+            cached_ans = _inject_page_links(cached_ans)
+
+            log_conversation(
+                user_message, cached_ans, ["Cache"], "cache",
+                (time.time() - start_t) * 1000,
+            )
+
+            yield json.dumps({"token": cached_ans, "sources": ["Cache"]}) + "\n"
+            return
+
+        # Semantic match — same tenant only
+        semantic_ans = find_semantic_cache_match(
+            get_cache_key(user_message, tenant_id),
+            tenant_id=tenant_id,
+            threshold=0.82,
+        )
+
+        if semantic_ans:
+            semantic_ans = _ensure_contact_footer(semantic_ans)
+            semantic_ans = _inject_page_links(semantic_ans)
+
+        if cache_enabled:
+            RESPONSE_CACHE[cache_key] = processed
+
+            threading.Thread(
+                target=_update_single_embedding,
+                args=(cache_key,),
+                daemon=True,
+            ).start()
+
+            threading.Thread(target=_save_cache, daemon=True).start()
+        log_conversation(
+            user_message, semantic_ans, ["Cache (Semantic)"],
+            "semantic_cache", (time.time() - start_t) * 1000,
+        )
+
+        yield json.dumps({
+            "token": semantic_ans,
+            "sources": ["Cache (Semantic)"],
+        }) + "\n"
+        return
+
+    # ── Keyword-based page injection ─────────────────────────────────────────
+    load_pages_cache()
+    pinned_docs: list[tuple[str, str]] = []   # (url, markdown)
+
+    if RAW_PAGES_CACHE:
+        pages = RAW_PAGES_CACHE
+
+        msg_lower = user_message.lower()
+
+        career_kw  = {"job", "jobs", "career", "careers", "opening", "openings",
+                      "vacancy", "vacancies", "apply", "hiring", "recruit", "position"}
+        pricing_kw = {"price", "pricing", "plan", "plans", "cost", "fee", "subscription",
+                      "basic", "premium", "enterprise", "custom plan"}
+        contact_kw = {"contact", "email", "phone", "address", "office", "location", "demo"}
+        product_kw = {"product", "products", "feature", "features", "module", "modules",
+                      "what do you offer", "what does iryax"}
+        about_kw   = {"about iryax", "who is iryax", "what is iryax", "tell me about iryax",
+                      "company overview", "who are iryax", "tell me about you",
+                      "info about iryax", "what does iryax do", "about company", "iryax overview",
+                      "founder", "co-founder", "ceo", "owner", "leadership", "team",
+                      "founded", "established", "started by", "created by", "built by"}
+        
+        workspace_kw = {"coworking", "workspace", "cabin", "desk", "room", "price","pricing","seat","seats","meeting room"}
+        recruitment_kw = {"recruitment", "hiring software", "ats", "applicant tracking"}
+        payroll_kw = {"payroll", "attendance", "leave management", "timesheet"}
+        task_kw = {"task management", "sprint", "agile"}
+        camp_kw = {"medical camp", "health camp"}
+        lab_kw = {"lab management", "laboratory"}
+
+        def matches(keywords):
+            return any(k in msg_lower for k in keywords)
+
+        def get_trimmed(text, limit=1800):
+            # Strip markdown images to avoid wasting character budget on image URLs
+            clean = re.sub(r'!\[.*?\]\(.*?\)', '', text)
+            # Strip repetitive navigation buttons like [Book Demo](/contact)
+            clean = re.sub(r'\[(?:Book Demo|Get Started|Learn More|About|View|Login|Client Login)\]\(.*?\)', '', clean, flags=re.IGNORECASE)
+            # Collapse multiple blank lines
+            clean = re.sub(r'\n{3,}', '\n\n', clean).strip()
+            return clean[:limit] + "..." if len(clean) > limit else clean
+
+        if matches(about_kw):
+            for url in ("https://iryax.com/about", "https://iryax.com"):
+                if url in pages:
+                    pinned_docs.append((url, get_trimmed(pages[url]["markdown"])))
+        if matches(career_kw):
+            for url in ("https://iryax.com/careers",):
+                if url in pages:
+                    pinned_docs.append((url, get_trimmed(pages[url]["markdown"])))
+        if matches(pricing_kw):
+            for url in ("https://iryax.com/price",):
+                if url in pages:
+                    pinned_docs.append((url, get_trimmed(pages[url]["markdown"])))
+        if matches(contact_kw):
+            for url in ("https://iryax.com/contact",):
+                if url in pages:
+                    pinned_docs.append((url, get_trimmed(pages[url]["markdown"])))
+        if matches(product_kw):
+            for url in ("https://iryax.com/products",):
+                if url in pages:
+                    pinned_docs.append((url, get_trimmed(pages[url]["markdown"])))
+        if matches(workspace_kw):
+            for url in ("https://iryax.com/workspace",):
+                if url in pages:
+                    pinned_docs.append((url, get_trimmed(pages[url]["markdown"])))
+        if matches(recruitment_kw):
+            for url in ("https://iryax.com/recruitment",):
+                if url in pages:
+                    pinned_docs.append((url, get_trimmed(pages[url]["markdown"])))
+        if matches(payroll_kw):
+            for url in ("https://iryax.com/attendance",):
+                if url in pages:
+                    pinned_docs.append((url, get_trimmed(pages[url]["markdown"])))
+        if matches(task_kw):
+            for url in ("https://iryax.com/task-management",):
+                if url in pages:
+                    pinned_docs.append((url, get_trimmed(pages[url]["markdown"])))
+        if matches(camp_kw):
+            for url in ("https://iryax.com/camp",):
+                if url in pages:
+                    pinned_docs.append((url, get_trimmed(pages[url]["markdown"])))
+
+    # ── Semantic retrieval from ChromaDB ──────────────────────────────────────
+    results = collection.query(
+        query_texts=[user_message],
+        n_results=2
+    )
+
+    context_parts = []
+    sources = []
+
+    # Pinned pages go first (highest priority)
+    pinned_urls = set()
+    for url, markdown in pinned_docs:
+        context_parts.append(f"[Source: Iryax Global — {url}]\n{markdown}")
+        sources.append(url)   # plain URL
+        pinned_urls.add(url)
+
+    # Then semantic results (skip if already pinned)
+    if results["documents"] and results["documents"][0]:
+        for doc, meta in zip(results["documents"][0], results["metadatas"][0]):
+            if meta["url"] not in pinned_urls:
+                trimmed_doc = get_trimmed(doc, limit=600)
+                context_parts.append(f"[Source: {meta['label']} — {meta['url']}]\n{trimmed_doc}")
+                sources.append(meta["url"])   # plain URL
+
+    context_str = "\n\n---\n\n".join(context_parts)
+
+    base_prompt = get_base_system_prompt()
+
+    if context_str:
+        system_content = (
+            base_prompt
+            + "\n\n<context>\n"
+            + context_str
+            + "\n</context>"
+            + f"\n\nREMINDER: You MUST append the contact details at the end of your response: 'For additional information, please contact us at {CONTACT_EMAIL} or call {CONTACT_PHONE}.'"
+        )
+    else:
+        system_content = base_prompt + "\n\nNote: No relevant Iryax data found. Say you don't have that information."
+        
+    messages = [{"role": "system", "content": system_content}]
+    messages.extend(history[-2:])
+    
+    enforced_user_message = user_message + f'\n\n(Remember to append the contact details: "For additional information, please contact us at {CONTACT_EMAIL} or call {CONTACT_PHONE}.")'
+    messages.append({"role": "user", "content": enforced_user_message})
+    
+    try:
+        client = get_groq_client()
+        stream = client.chat.completions.create(
+            model=MODEL_NAME,
+            messages=messages,
+            stream=True,
+            temperature=0.1,
+            max_tokens=800,
+            timeout=15.0,  # 15s timeout for production resilience
+        )
+        
+        # Buffer the full LLM response first, then post-process and yield
+        full_response = ""
+        for chunk in stream:
+            delta = chunk.choices[0].delta if chunk.choices else None
+            if delta and delta.content:
+                full_response += delta.content
+
+        # Post-process: inject page links reliably (LLM is not reliable for this)
+        processed = _inject_page_links(full_response)
+
+        # Yield the processed response as a single token so links aren't split
+        yield json.dumps({"token": processed, "sources": sources, "inference_mode": "groq_cloud_llm"}) + "\n"
+
+        RESPONSE_CACHE[cache_key] = processed
+        threading.Thread(target=_update_single_embedding, args=(cache_key,), daemon=True).start()
+        threading.Thread(target=_save_cache, daemon=True).start()
+        log_conversation(user_message, processed, sources, "rag_llm", (time.time() - start_t) * 1000)
+    except Exception as e:
+        err_msg = str(e)
+        if GROQ_API_KEY:
+            err_msg = err_msg.replace(GROQ_API_KEY, "[REDACTED_GROQ_KEY]")
+        logger.warning("Groq API unavailable or timed out (%s). Engaging deterministic fallback.", err_msg)
+        
+        # Grounded fallback response extracted directly from verified context
+        fallback_header = "> [!NOTE]\n> *AI Connectivity Status: Operating in Grounded RAG Knowledge Fallback (Groq API offline or key not provided).*\n\n"
+        if context_parts:
+            # Deterministic synthesis of top context chunk
+            sample_text = context_parts[0].split("\n", 1)[-1].strip()
+            fallback_body = f"Based on verified platform documentation:\n\n{sample_text[:450]}...\n\nFor additional information, please contact us at {CONTACT_EMAIL} or call {CONTACT_PHONE}."
+        else:
+            fallback_body = f"Iryax is an AI-powered enterprise platform. For additional information, please contact us at {CONTACT_EMAIL} or call {CONTACT_PHONE}."
+        
+        processed_fallback = fallback_header + fallback_body
+        yield json.dumps({
+            "token": processed_fallback,
+            "sources": sources or ["Iryax Documentation"],
+            "inference_mode": "deterministic_knowledge_fallback",
+        }) + "\n"
+
+# Backend forced reload to clear in-memory cache again!

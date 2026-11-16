@@ -1,0 +1,76 @@
+{% extends "main.html" %}
+
+{% block extrahead %}
+  {{ super() }}
+  <style>
+    .md-content__button { display: none; }
+    .md-content__inner { padding-top: 0; }
+  </style>
+{% endblock %}
+
+{% block tabs %}
+  {{ super() }}
+  <section class="ac-hero" aria-labelledby="ac-hero-title">
+    <div class="ac-hero__bg" aria-hidden="true"></div>
+    <div class="ac-hero__grid md-grid">
+      <div class="ac-hero__copy">
+        <div id="ac-hero-title" class="ac-hero__title" role="heading" aria-level="1">
+          Build AI agent teams with a runtime you can reason about.
+        </div>
+        <p class="ac-hero__lede">
+          AnyCode coordinates specialized agents through typed tools, dependency-aware
+          task graphs, shared context, provider-neutral adapters, durable execution,
+          and verification you can inspect.
+        </p>
+        <div class="ac-hero__cta">
+          <a class="ac-btn ac-btn--primary" href="{{ 'getting-started/quickstart/' | url }}">
+            Start the quickstart
+            <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
+          </a>
+          <a class="ac-btn ac-btn--ghost" href="https://github.com/Quantlix/anycode" target="_blank" rel="noopener">
+            View on GitHub
+          </a>
+        </div>
+        <div class="ac-install" aria-label="Install AnyCode">
+          <span class="ac-install__prompt" aria-hidden="true">$</span>
+          <code>uv add anycode-py</code>
+          <a href="{{ 'getting-started/installation/' | url }}">Installation options</a>
+        </div>
+        <p class="ac-hero__note">
+          Requires Python 3.12 or newer. AnyCode is under active development; review
+          the production-readiness boundary before deploying sensitive workloads.
+        </p>
+      </div>
+
+      <div class="ac-hero__code" aria-label="AnyCode team example">
+        <div class="ac-window">
+          <div class="ac-window__bar">
+            <span class="ac-window__dot"></span>
+            <span class="ac-window__dot"></span>
+            <span class="ac-window__dot"></span>
+            <span class="ac-window__name">run_team.py</span>
+          </div>
+          <pre class="ac-window__code"><code><span class="k">from</span> anycode <span class="k">import</span> AnyCode
+
+engine = AnyCode.from_config(<span class="s">"team.yaml"</span>)
+
+result = <span class="k">await</span> engine.run_team_from_config(
+    goal=<span class="s">"Ship a reviewed implementation"</span>
+)
+
+<span class="k">if</span> result.success:
+    print(<span class="s">"Ready to ship"</span>)</code></pre>
+        </div>
+        <div class="ac-flow" aria-label="Dependency-ordered workflow">
+          <span>Plan</span><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
+          <span>Build</span><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
+          <span>Review</span>
+        </div>
+      </div>
+    </div>
+  </section>
+{% endblock %}
+
+{% block content %}
+  {{ super() }}
+{% endblock %}

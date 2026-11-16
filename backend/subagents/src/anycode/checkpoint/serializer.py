@@ -1,0 +1,159 @@
+"""Deterministic round-trip serialization for CheckpointData and LLMMessage content blocks."""
+
+from __future__ import annotations
+
+import json
+from typing import Any
+
+from anycode.constants import (
+    BLOCK_TYPE_IMAGE,
+    BLOCK_TYPE_REDACTED_THINKING,
+    BLOCK_TYPE_TEXT,
+    BLOCK_TYPE_THINKING,
+    BLOCK_TYPE_TOOL_RESULT,
+    BLOCK_TYPE_TOOL_USE,
+    CHECKPOINT_FORMAT_VERSION,
+    CHECKPOINT_MIN_FORMAT_VERSION,
+)
+from anycode.security.redaction import redact_sensitive
+from anycode.types import (
+    AgentRunResult,
+    CheckpointData,
+    ContentBlock,
+    ContextManifest,
+    ImageBlock,
+    ImageSource,
+    LifecycleEvent,
+    LLMMessage,
+    QualityGateDecision,
+    RedactedThinkingBlock,
+    StopReason,
+    Task,
+    TextBlock,
+    ThinkingBlock,
+    TokenUsage,
+    ToolCallRecord,
+    ToolResultBlock,
+    ToolUseBlock,
+    VerificationResult,
+)
+
+
+class UnsupportedCheckpointVersionError(ValueError):
+    """Raised when a checkpoint uses a format this runtime cannot read."""
+
+
+def serialize_checkpoint(data: CheckpointData, *, redact_sensitive_data: bool = True) -> str:
+    payload = {
+        "id": data.id,
+        "workflow_id": data.workflow_id,
+        "version": data.version,
+        "wave_index": data.wave_index,
+        "total_token_usage": data.total_token_usage.model_dump(mode="json"),
+        "created_at": data.created_at.isoformat(),
+        "metadata": data.metadata,
+        "tasks": [_serialize_task(t) for t in data.tasks],
+        "agent_results": {k: _serialize_agent_result(v) for k, v in data.agent_results.items()},
+    }
+    if redact_sensitive_data:
+        payload = redact_sensitive(payload)
+    return json.dumps(payload, indent=2, default=str)
+
+
+def deserialize_checkpoint(raw: str) -> CheckpointData:
+    data = json.loads(raw)
+    version = data.get("version", CHECKPOINT_MIN_FORMAT_VERSION)
+    if type(version) is not int or not CHECKPOINT_MIN_FORMAT_VERSION <= version <= CHECKPOINT_FORMAT_VERSION:
+        raise UnsupportedCheckpointVersionError(
+            f"Unsupported checkpoint format version {version!r}; supported versions are "
+            f"{CHECKPOINT_MIN_FORMAT_VERSION} through {CHECKPOINT_FORMAT_VERSION}"
+        )
+    return CheckpointData(
+        id=data["id"],
+        workflow_id=data["workflow_id"],
+        version=version,
+        wave_index=data["wave_index"],
+        total_token_usage=TokenUsage(**data["total_token_usage"]),
+        created_at=data["created_at"],
+        metadata=data.get("metadata"),
+        tasks=[_deserialize_task(t) for t in data["tasks"]],
+        agent_results={k: _deserialize_agent_result(v) for k, v in data["agent_results"].items()},
+    )
+
+
+def _serialize_task(task: Task) -> dict[str, Any]:
+    return task.model_dump(mode="json")
+
+
+def _deserialize_task(data: dict[str, Any]) -> Task:
+    return Task(**data)
+
+
+def _serialize_agent_result(result: AgentRunResult) -> dict[str, Any]:
+    return {
+        "success": result.success,
+        "output": result.output,
+        "token_usage": result.token_usage.model_dump(mode="json"),
+        "tool_calls": [tc.model_dump(mode="json") for tc in result.tool_calls],
+        "messages": [_serialize_message(m) for m in result.messages],
+        "terminal_phase": result.terminal_phase,
+        "stop_reason": result.stop_reason.model_dump(mode="json") if result.stop_reason else None,
+        "retries": result.retries,
+        "lifecycle_events": [e.model_dump(mode="json") for e in result.lifecycle_events],
+        "context_manifests": [m.model_dump(mode="json") for m in result.context_manifests],
+        "verification_results": [v.model_dump(mode="json") for v in result.verification_results],
+        "gate_decisions": [g.model_dump(mode="json") for g in result.gate_decisions],
+    }
+
+
+def _deserialize_agent_result(data: dict[str, Any]) -> AgentRunResult:
+    stop_reason_data = data.get("stop_reason")
+    return AgentRunResult(
+        success=data["success"],
+        output=data["output"],
+        token_usage=TokenUsage(**data["token_usage"]),
+        tool_calls=[ToolCallRecord(**tc) for tc in data.get("tool_calls", [])],
+        messages=[_deserialize_message(m) for m in data.get("messages", [])],
+        terminal_phase=data.get("terminal_phase"),
+        stop_reason=StopReason.model_validate(stop_reason_data) if stop_reason_data else None,
+        retries=data.get("retries", 0),
+        lifecycle_events=[LifecycleEvent.model_validate(e) for e in data.get("lifecycle_events", [])],
+        context_manifests=[ContextManifest.model_validate(m) for m in data.get("context_manifests", [])],
+        verification_results=[VerificationResult.model_validate(v) for v in data.get("verification_results", [])],
+        gate_decisions=[QualityGateDecision.model_validate(g) for g in data.get("gate_decisions", [])],
+    )
+
+
+def _serialize_message(msg: LLMMessage) -> dict[str, Any]:
+    return {
+        "role": msg.role,
+        "content": [_serialize_content_block(b) for b in msg.content],
+    }
+
+
+def _deserialize_message(data: dict[str, Any]) -> LLMMessage:
+    return LLMMessage(
+        role=data["role"],
+        content=[_deserialize_content_block(b) for b in data["content"]],
+    )
+
+
+def _serialize_content_block(block: ContentBlock) -> dict[str, Any]:
+    return block.model_dump(mode="json")
+
+
+def _deserialize_content_block(data: dict[str, Any]) -> ContentBlock:
+    block_type = data.get("type")
+    if block_type == BLOCK_TYPE_TEXT:
+        return TextBlock(**data)
+    if block_type == BLOCK_TYPE_TOOL_USE:
+        return ToolUseBlock(**data)
+    if block_type == BLOCK_TYPE_TOOL_RESULT:
+        return ToolResultBlock(**data)
+    if block_type == BLOCK_TYPE_IMAGE:
+        return ImageBlock(type=BLOCK_TYPE_IMAGE, source=ImageSource(**data["source"]))
+    if block_type == BLOCK_TYPE_THINKING:
+        return ThinkingBlock(**data)
+    if block_type == BLOCK_TYPE_REDACTED_THINKING:
+        return RedactedThinkingBlock(**data)
+    raise ValueError(f"Unknown content block type: {block_type!r}")
